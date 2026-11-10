@@ -1,6 +1,7 @@
 # AudioForge
 
 A native C++ audio converter for Windows.
+<img width="571" height="390" alt="test" src="https://github.com/user-attachments/assets/8f7702d6-25fb-47be-82ec-a8a33b5edca7" />
 
 ## Build
 
