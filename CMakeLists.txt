@@ -8,7 +8,7 @@ endif()
 add_executable(AudioForge WIN32 src/main.cpp)
 target_compile_features(AudioForge PRIVATE cxx_std_17)
 target_compile_definitions(AudioForge PRIVATE UNICODE _UNICODE)
-target_link_libraries(AudioForge PRIVATE comctl32 comdlg32 dwmapi shell32)
+target_link_libraries(AudioForge PRIVATE comctl32 comdlg32 dwmapi shell32 uxtheme)
 
 find_program(FFMPEG_EXECUTABLE NAMES ffmpeg ffmpeg.exe REQUIRED)
 find_program(FFPROBE_EXECUTABLE NAMES ffprobe ffprobe.exe REQUIRED)

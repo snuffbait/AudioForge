@@ -7,6 +7,7 @@
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <uxtheme.h>
 
 #include <algorithm>
 #include <atomic>
@@ -45,7 +46,7 @@ constexpr UINT kTaskUpdateMessage = WM_APP + 1;
 constexpr UINT kConversionCompleteMessage = WM_APP + 2;
 constexpr UINT kArtworkReadyMessage = WM_APP + 4;
 constexpr UINT kMetadataReadyMessage = WM_APP + 5;
-constexpr int kFooterHeight = 60;
+constexpr int kFooterHeight = 44;
 
 enum ControlId : int {
     IdAddFiles = 100,
@@ -1634,6 +1635,7 @@ void createControls(HWND window) {
     g_list = CreateWindowExW(0, WC_LISTVIEWW, L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS,
         0, 0, 100, 100, window, nullptr, GetModuleHandleW(nullptr), nullptr);
+    SetWindowTheme(g_list, L"DarkMode_Explorer", nullptr);
     HWND header = ListView_GetHeader(g_list);
     ListView_SetExtendedListViewStyle(g_list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER |
                                               LVS_EX_LABELTIP | LVS_EX_HEADERDRAGDROP);
@@ -1747,12 +1749,12 @@ void layoutControls(HWND window) {
     const int convertX = width - margin - convertWidth;
     const int browseX = convertX - 8 - browseWidth;
     const int outputX = browseX - 8 - outputWidth;
-    MoveWindow(g_output, outputX, footerTop + 18, outputWidth, 30, TRUE);
-    MoveWindow(g_buttons[4], browseX, footerTop + 16, browseWidth, 34, TRUE);
-    MoveWindow(g_buttons[5], convertX, footerTop + 16, convertWidth, 34, TRUE);
-    MoveWindow(g_buttons[6], convertX, footerTop + 16, stopWidth, 34, TRUE);
-    MoveWindow(g_statusLabel, margin, footerTop + 7, 245, 19, TRUE);
-    MoveWindow(g_progress, margin, footerTop + 49,
+    MoveWindow(g_output, outputX, footerTop + 7, outputWidth, 30, TRUE);
+    MoveWindow(g_buttons[4], browseX, footerTop + 5, browseWidth, 34, TRUE);
+    MoveWindow(g_buttons[5], convertX, footerTop + 5, convertWidth, 34, TRUE);
+    MoveWindow(g_buttons[6], convertX, footerTop + 5, stopWidth, 34, TRUE);
+    MoveWindow(g_statusLabel, margin, footerTop + 3, 245, 19, TRUE);
+    MoveWindow(g_progress, margin, footerTop + 26,
                (std::max)(120, outputX - margin - 20), 8, TRUE);
     updateListColumns();
 }
@@ -2180,7 +2182,7 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
-}
+} // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     SetProcessDPIAware();
