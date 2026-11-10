@@ -5,6 +5,7 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <dwmapi.h>
+#include <mmsystem.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <uxtheme.h>
@@ -25,6 +26,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <set>
 #include <sstream>
 #include <string>
@@ -35,6 +37,7 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "winmm.lib")
 #endif
 
 namespace fs = std::filesystem;
@@ -47,6 +50,7 @@ constexpr UINT kConversionCompleteMessage = WM_APP + 2;
 constexpr UINT kArtworkReadyMessage = WM_APP + 4;
 constexpr UINT kMetadataReadyMessage = WM_APP + 5;
 constexpr int kFooterHeight = 44;
+constexpr WORD kApplicationIconResource = 101;
 
 enum ControlId : int {
     IdAddFiles = 100,
@@ -222,6 +226,7 @@ HWND g_format = nullptr;
 HWND g_quality = nullptr;
 HWND g_workers = nullptr;
 HWND g_output = nullptr;
+fs::path g_defaultOutputFolder;
 HWND g_emptyLabel = nullptr;
 HWND g_statusLabel = nullptr;
 HWND g_progress = nullptr;
@@ -245,6 +250,7 @@ std::atomic_bool g_cancel{false};
 std::mutex g_activeProcessMutex;
 std::vector<HANDLE> g_activeProcesses;
 bool g_isConverting = false;
+bool g_completionSoundOpen = false;
 int g_completedCount = 0;
 int g_failedCount = 0;
 int g_cancelledCount = 0;
@@ -409,12 +415,12 @@ std::wstring makeOutputName(const fs::path& input, const fs::path& outputFolder,
     fs::path candidate = folder / (stem + extension);
     if (lower(candidate.wstring()) == lower(input.wstring()) || fs::exists(candidate) ||
         reservedNames.count(lower(candidate.wstring())) != 0) {
-        candidate = folder / (stem + L" (converted)" + extension);
+        candidate = folder / (stem + L" (2)" + extension);
     }
-    unsigned suffix = 2;
+    unsigned suffix = 3;
     while (lower(candidate.wstring()) == lower(input.wstring()) || fs::exists(candidate) ||
            reservedNames.count(lower(candidate.wstring())) != 0) {
-        candidate = folder / (stem + L" (converted " + std::to_wstring(suffix++) + L")" + extension);
+        candidate = folder / (stem + L" (" + std::to_wstring(suffix++) + L")" + extension);
     }
     reservedNames.insert(lower(candidate.wstring()));
     return candidate.wstring();
@@ -1451,13 +1457,13 @@ void beginConversion() {
                 const fs::path parent = destination.empty()
                     ? sourceFolder.parent_path()
                     : destination;
-                const std::wstring baseName = sourceFolder.filename().wstring() + L" (converted)";
+                const std::wstring baseName = sourceFolder.filename().wstring();
                 fs::path candidate = parent / baseName;
                 unsigned suffix = 2;
                 while (fs::exists(candidate, directoryError) ||
                        reservedGroupRoots.count(lower(candidate.wstring())) != 0) {
                     candidate = parent / (sourceFolder.filename().wstring() +
-                        L" (converted " + std::to_wstring(suffix++) + L")");
+                        L" (" + std::to_wstring(suffix++) + L")");
                 }
                 reservedGroupRoots.insert(lower(candidate.wstring()));
                 group = groupOutputRoots.emplace(groupKey, candidate).first;
@@ -1625,7 +1631,8 @@ void createControls(HWND window) {
                                                           reinterpret_cast<LPARAM>(choice));
     SendMessageW(g_workers, CB_SETCURSEL, 0, 0);
 
-    g_output = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+    g_output = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT",
+        g_defaultOutputFolder.c_str(),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
         0, 0, 200, 30, window, reinterpret_cast<HMENU>(IdOutput), nullptr, nullptr);
     SendMessageW(g_output, EM_SETCUEBANNER, TRUE,
@@ -1992,6 +1999,40 @@ void handleTaskUpdate(LPARAM parameter) {
     SetWindowTextW(g_statusLabel, summary.c_str());
 }
 
+void playCompletionSound() {
+    if (g_completedCount == 0) return;
+    if (g_completionSoundOpen) {
+        mciSendStringW(L"close AudioForgeCompletionSound", nullptr, 0, nullptr);
+        g_completionSoundOpen = false;
+    }
+
+    static std::mt19937 generator(std::random_device{}());
+    static std::bernoulli_distribution playGoblin(0.01);
+    const wchar_t* filename = playGoblin(generator)
+        ? L"done-goblin.mp3" : L"done.mp3";
+    const fs::path sound = g_defaultOutputFolder.parent_path() / L"assets" / filename;
+    const std::wstring openCommand = L"open " + quoteArgument(sound.wstring()) +
+        L" type mpegvideo alias AudioForgeCompletionSound";
+    MCIERROR error = mciSendStringW(openCommand.c_str(), nullptr, 0, nullptr);
+    if (error == 0) {
+        g_completionSoundOpen = true;
+        error = mciSendStringW(L"play AudioForgeCompletionSound notify",
+                               nullptr, 0, g_window);
+        if (error != 0) {
+            mciSendStringW(L"close AudioForgeCompletionSound", nullptr, 0, nullptr);
+            g_completionSoundOpen = false;
+        }
+    }
+    if (error != 0) {
+        wchar_t message[256]{};
+        const wchar_t* detail = mciGetErrorStringW(error, message,
+            static_cast<UINT>(std::size(message)))
+            ? message : L"Could not play the completion sound.";
+        MessageBoxW(g_window, detail, L"AudioForge sound error",
+                    MB_OK | MB_ICONWARNING);
+    }
+}
+
 void handleConversionComplete() {
     for (auto& worker : g_workerThreads) {
         if (worker.joinable()) worker.join();
@@ -2015,6 +2056,7 @@ void handleConversionComplete() {
         L" converted, " + std::to_wstring(g_failedCount) + L" failed, " +
         std::to_wstring(g_cancelledCount) + L" cancelled";
     SetWindowTextW(g_statusLabel, summary.c_str());
+    playCompletionSound();
     if (g_failedCount > 0) {
         MessageBoxW(g_window,
             L"Some audio files could not be converted. Check their queue status and make sure FFmpeg supports the selected codec.",
@@ -2121,13 +2163,27 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
     }
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
-        case IdAddFiles: chooseFiles(); return 0;
-        case IdAddFolder: chooseFolder(); return 0;
-        case IdBrowseOutput: chooseOutputFolder(); return 0;
-        case IdRemove: removeSelectedRows(); return 0;
-        case IdClear: clearQueue(); return 0;
-        case IdConvert: beginConversion(); return 0;
-        case IdStop: stopConversion(); return 0;
+        case IdAddFiles:
+            if (HIWORD(wParam) == BN_CLICKED) chooseFiles();
+            return 0;
+        case IdAddFolder:
+            if (HIWORD(wParam) == BN_CLICKED) chooseFolder();
+            return 0;
+        case IdBrowseOutput:
+            if (HIWORD(wParam) == BN_CLICKED) chooseOutputFolder();
+            return 0;
+        case IdRemove:
+            if (HIWORD(wParam) == BN_CLICKED) removeSelectedRows();
+            return 0;
+        case IdClear:
+            if (HIWORD(wParam) == BN_CLICKED) clearQueue();
+            return 0;
+        case IdConvert:
+            if (HIWORD(wParam) == BN_CLICKED) beginConversion();
+            return 0;
+        case IdStop:
+            if (HIWORD(wParam) == BN_CLICKED) stopConversion();
+            return 0;
         case IdQuality:
             if (HIWORD(wParam) == CBN_SELCHANGE) InvalidateRect(window, nullptr, FALSE);
             return 0;
@@ -2152,6 +2208,21 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
     case kConversionCompleteMessage:
         handleConversionComplete();
         return 0;
+    case MM_MCINOTIFY:
+        if (g_completionSoundOpen) {
+            const MCIERROR error =
+                mciSendStringW(L"close AudioForgeCompletionSound", nullptr, 0, nullptr);
+            g_completionSoundOpen = false;
+            if (error != 0) {
+                wchar_t message[256]{};
+                const wchar_t* detail = mciGetErrorStringW(error, message,
+                    static_cast<UINT>(std::size(message)))
+                    ? message : L"Could not close the completion sound.";
+                MessageBoxW(window, detail, L"AudioForge sound error",
+                            MB_OK | MB_ICONWARNING);
+            }
+        }
+        return 0;
     case WM_GETMINMAXINFO: {
         auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
         info->ptMinTrackSize.x = 760;
@@ -2170,6 +2241,10 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         DestroyWindow(window);
         return 0;
     case WM_DESTROY:
+        if (g_completionSoundOpen) {
+            mciSendStringW(L"close AudioForgeCompletionSound", nullptr, 0, nullptr);
+            g_completionSoundOpen = false;
+        }
         stopArtworkWorker();
         stopMetadataWorker();
         if (g_themePanelBrush) DeleteObject(g_themePanelBrush);
@@ -2186,6 +2261,25 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     SetProcessDPIAware();
+    std::wstring modulePath(32768, L'\0');
+    const DWORD moduleLength = GetModuleFileNameW(nullptr, modulePath.data(),
+        static_cast<DWORD>(modulePath.size()));
+    if (moduleLength == 0 || moduleLength >= modulePath.size()) {
+        MessageBoxW(nullptr, L"Could not determine the application folder.",
+                    L"AudioForge", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    modulePath.resize(moduleLength);
+    g_defaultOutputFolder = fs::path(modulePath).parent_path() / L"output";
+    std::error_code outputError;
+    fs::create_directories(g_defaultOutputFolder, outputError);
+    if (outputError) {
+        MessageBoxW(nullptr,
+            (L"Could not create the default output folder:\n" +
+             g_defaultOutputFolder.wstring()).c_str(),
+            L"AudioForge", MB_OK | MB_ICONERROR);
+        return 1;
+    }
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS};
     InitCommonControlsEx(&controls);
 
@@ -2195,7 +2289,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     windowClass.lpfnWndProc = windowProcedure;
     windowClass.hInstance = instance;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    windowClass.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    windowClass.hIcon = LoadIconW(instance,
+        MAKEINTRESOURCEW(kApplicationIconResource));
+    windowClass.hIconSm = windowClass.hIcon;
     windowClass.hbrBackground = nullptr;
     windowClass.lpszClassName = kClassName;
     if (!RegisterClassExW(&windowClass)) {
