@@ -3,6 +3,7 @@
 A Windows audio converter written in C++.
 
 <img width="575" height="391" alt="fdfgdgdgdgf" src="https://github.com/user-attachments/assets/1a52832a-bfc3-4b2c-8587-d8deae48bdad" />
+
 ## Requirements
 
 - Visual Studio 2022 with the **Desktop development with C++** workload
