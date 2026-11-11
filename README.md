@@ -21,3 +21,5 @@ cmake --build build --config Release
 
 Run `build\Release\AudioForge.exe`. The build copies `ffmpeg.exe` and
 `ffprobe.exe` beside the application.
+
+WARNING BY COMPILING THIS SOFTWARE YOU ARE AGREEING THAT A GOBLIN MIGHT BE FORCED INTO CONVERTING ALL YOUR AUDIO FILES BE WARNED USE AT YOUR OWN RISK 
