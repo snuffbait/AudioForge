@@ -60,7 +60,6 @@ enum ControlId : int {
     IdBrowseOutput,
     IdFormat,
     IdQuality,
-    IdWorkers,
     IdOutput,
     IdConvert,
     IdStop,
@@ -214,6 +213,12 @@ struct WorkerTask {
     int profile;
 };
 
+enum class ConversionResult {
+    Complete,
+    Failed,
+    Cancelled,
+};
+
 struct TaskUpdate {
     size_t index;
     std::wstring status;
@@ -224,7 +229,6 @@ HWND g_list = nullptr;
 HIMAGELIST g_rowImages = nullptr;
 HWND g_format = nullptr;
 HWND g_quality = nullptr;
-HWND g_workers = nullptr;
 HWND g_output = nullptr;
 fs::path g_defaultOutputFolder;
 HWND g_emptyLabel = nullptr;
@@ -244,8 +248,6 @@ std::mutex g_metadataMutex;
 std::condition_variable g_metadataCondition;
 std::deque<MetadataRequest> g_metadataQueue;
 bool g_metadataStop = false;
-std::atomic_size_t g_nextTask{0};
-std::atomic_size_t g_finishedWorkers{0};
 std::atomic_bool g_cancel{false};
 std::mutex g_activeProcessMutex;
 std::vector<HANDLE> g_activeProcesses;
@@ -789,7 +791,8 @@ ArtworkResult prepareOpusArtwork(const std::wstring& ffmpegPath,
         : ArtworkResult::Failed;
 }
 
-void runConversion(const WorkerTask& task, const std::wstring& ffmpegPath) {
+ConversionResult runConversion(const WorkerTask& task, const std::wstring& ffmpegPath,
+                               std::wstring& failureReason) {
     const fs::path output(task.output);
     const std::wstring temporarySuffix =
         L".AudioForge-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
@@ -799,6 +802,10 @@ void runConversion(const WorkerTask& task, const std::wstring& ffmpegPath) {
         (output.stem().wstring() + temporarySuffix + output.extension().wstring());
     std::error_code fileError;
     fs::remove(temporary, fileError);
+    const auto fail = [&failureReason](const wchar_t* reason) {
+        failureReason = reason;
+        return ConversionResult::Failed;
+    };
 
     const bool opusWithArtwork = task.format == 5;
     bool hasArtworkMetadata = false;
@@ -806,8 +813,7 @@ void runConversion(const WorkerTask& task, const std::wstring& ffmpegPath) {
     if (opusWithArtwork) {
         postTaskUpdate(task.index, L"Checking embedded cover...");
         if (!createTemporaryDirectory(task.index, artworkDirectory.path)) {
-            postTaskUpdate(task.index, L"Failed: could not create temporary artwork folder");
-            return;
+            return fail(L"could not create temporary artwork folder");
         }
         const fs::path coverPath = artworkDirectory.path / L"cover.png";
         const fs::path artworkMetadataPath = artworkDirectory.path / L"artwork.ffmeta";
@@ -815,11 +821,10 @@ void runConversion(const WorkerTask& task, const std::wstring& ffmpegPath) {
             prepareOpusArtwork(ffmpegPath, task.input, coverPath, artworkMetadataPath);
         if (artwork == ArtworkResult::Cancelled) {
             postTaskUpdate(task.index, L"Cancelled");
-            return;
+            return ConversionResult::Cancelled;
         }
         if (artwork == ArtworkResult::Failed) {
-            postTaskUpdate(task.index, L"Failed: could not preserve embedded cover art");
-            return;
+            return fail(L"could not preserve embedded cover art");
         }
         hasArtworkMetadata = artwork == ArtworkResult::Ready;
     }
@@ -831,8 +836,7 @@ void runConversion(const WorkerTask& task, const std::wstring& ffmpegPath) {
     HANDLE readPipe = nullptr;
     HANDLE writePipe = nullptr;
     if (!CreatePipe(&readPipe, &writePipe, &security, 0)) {
-        postTaskUpdate(task.index, L"Failed: could not create FFmpeg output pipe");
-        return;
+        return fail(L"could not create FFmpeg output pipe");
     }
     SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
 
@@ -855,8 +859,7 @@ void runConversion(const WorkerTask& task, const std::wstring& ffmpegPath) {
     if (!profiles || task.profile < 0 ||
         static_cast<size_t>(task.profile) >= profileCount) {
         fs::remove(temporary, fileError);
-        postTaskUpdate(task.index, L"Failed: invalid encoder profile");
-        return;
+        return fail(L"invalid encoder profile");
     }
     const EncoderProfile& profile = profiles[task.profile];
     command += L" -c:a ";
@@ -882,8 +885,7 @@ void runConversion(const WorkerTask& task, const std::wstring& ffmpegPath) {
 
     if (!created) {
         CloseHandle(readPipe);
-        postTaskUpdate(task.index, L"Failed: FFmpeg could not be started");
-        return;
+        return fail(L"FFmpeg could not be started");
     }
 
     {
@@ -958,18 +960,20 @@ void runConversion(const WorkerTask& task, const std::wstring& ffmpegPath) {
     if (cancelled || g_cancel.load()) {
         fs::remove(temporary, fileError);
         postTaskUpdate(task.index, L"Cancelled");
+        return ConversionResult::Cancelled;
     } else if (exitCode == 0 && fs::is_regular_file(temporary, fileError)) {
         SetFileAttributesW(temporary.c_str(), FILE_ATTRIBUTE_NORMAL);
         fs::rename(temporary, output, fileError);
         if (fileError) {
             fs::remove(temporary, fileError);
-            postTaskUpdate(task.index, L"Failed: could not save output file");
+            return fail(L"could not save output file");
         } else {
             postTaskUpdate(task.index, L"Complete");
+            return ConversionResult::Complete;
         }
     } else {
         fs::remove(temporary, fileError);
-        postTaskUpdate(task.index, L"Failed: FFmpeg could not convert this file");
+        return fail(L"FFmpeg could not convert this file");
     }
 }
 
@@ -1386,7 +1390,6 @@ void setControlsEnabled(bool enabled) {
     for (HWND button : g_buttons) EnableWindow(button, enabled);
     EnableWindow(g_format, enabled);
     EnableWindow(g_quality, enabled);
-    EnableWindow(g_workers, enabled);
     EnableWindow(g_output, enabled);
     EnableWindow(g_list, enabled);
     ShowWindow(g_buttons[5], enabled ? SW_SHOW : SW_HIDE);
@@ -1430,17 +1433,6 @@ void beginConversion() {
                     L"Invalid encoding profile", MB_OK | MB_ICONWARNING);
         return;
     }
-    const int selectedWorkers = static_cast<int>(SendMessageW(g_workers, CB_GETCURSEL, 0, 0));
-    unsigned int hardwareThreads = std::thread::hardware_concurrency();
-    if (hardwareThreads == 0) hardwareThreads = 1;
-    size_t workerCount = (std::min)(static_cast<size_t>(hardwareThreads), size_t{4});
-    if (selectedWorkers > 0) {
-        const int requested[] = {0, 1, 2, 4, 8};
-        workerCount = (std::min)(static_cast<size_t>(requested[selectedWorkers]),
-                                 static_cast<size_t>(hardwareThreads));
-    }
-    workerCount = (std::max)(size_t{1}, (std::min)(workerCount, g_tracks.size()));
-
     std::vector<WorkerTask> tasks;
     tasks.reserve(g_tracks.size());
     std::set<std::wstring> reservedNames;
@@ -1493,8 +1485,6 @@ void beginConversion() {
 
     g_isConverting = true;
     g_cancel = false;
-    g_nextTask = 0;
-    g_finishedWorkers = 0;
     g_completedCount = 0;
     g_failedCount = 0;
     g_cancelledCount = 0;
@@ -1506,18 +1496,29 @@ void beginConversion() {
     InvalidateRect(g_window, nullptr, FALSE);
 
     const auto sharedTasks = std::make_shared<const std::vector<WorkerTask>>(std::move(tasks));
-    for (size_t i = 0; i < workerCount; ++i) {
-        g_workerThreads.emplace_back([sharedTasks, ffmpeg, workerCount]() {
+    g_workerThreads.emplace_back([sharedTasks, ffmpeg]() {
+        for (size_t index = 0; index < sharedTasks->size() && !g_cancel.load(); ++index) {
+            size_t attempt = 0;
             while (!g_cancel.load()) {
-                const size_t index = g_nextTask.fetch_add(1);
-                if (index >= sharedTasks->size()) break;
-                runConversion((*sharedTasks)[index], ffmpeg);
+                std::wstring failureReason;
+                const ConversionResult result =
+                    runConversion((*sharedTasks)[index], ffmpeg, failureReason);
+                if (result != ConversionResult::Failed) break;
+
+                ++attempt;
+                postTaskUpdate(index, L"Retrying after attempt " +
+                    std::to_wstring(attempt) + L" failed: " + failureReason);
+                for (int waited = 0; waited < 1000 && !g_cancel.load(); waited += 100) {
+                    Sleep(100);
+                }
+                if (g_cancel.load()) {
+                    postTaskUpdate(index, L"Cancelled");
+                    break;
+                }
             }
-            if (g_finishedWorkers.fetch_add(1) + 1 == workerCount) {
-                PostMessageW(g_window, kConversionCompleteMessage, 0, 0);
-            }
-        });
-    }
+        }
+        PostMessageW(g_window, kConversionCompleteMessage, 0, 0);
+    });
 }
 
 void stopConversion() {
@@ -1622,15 +1623,6 @@ void createControls(HWND window) {
     SetWindowSubclass(g_quality, darkComboProc, 1, 0);
     updateQualityChoices();
 
-    g_workers = CreateWindowExW(0, WC_COMBOBOXW, L"",
-        comboStyle,
-        0, 0, 105, 140, window, reinterpret_cast<HMENU>(IdWorkers), nullptr, nullptr);
-    SetWindowSubclass(g_workers, darkComboProc, 1, 0);
-    const wchar_t* workerChoices[] = {L"Auto", L"1 worker", L"2 workers", L"4 workers", L"8 workers"};
-    for (const auto* choice : workerChoices) SendMessageW(g_workers, CB_ADDSTRING, 0,
-                                                          reinterpret_cast<LPARAM>(choice));
-    SendMessageW(g_workers, CB_SETCURSEL, 0, 0);
-
     g_output = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT",
         g_defaultOutputFolder.c_str(),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
@@ -1703,7 +1695,7 @@ void createControls(HWND window) {
         ListView_SetImageList(g_list, g_rowImages, LVSIL_SMALL);
     }
 
-    for (HWND child : {g_format, g_quality, g_workers, g_output, g_list, g_progress}) {
+    for (HWND child : {g_format, g_quality, g_output, g_list, g_progress}) {
         SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
     }
     updateListColumns();
@@ -1729,17 +1721,14 @@ void layoutControls(HWND window) {
     x += 78;
 
     const int rightMargin = width - margin;
-    const int workersWidth = 112;
     const int qualityWidth = 170;
     const int selectorsY = compactToolbar ? 49 : toolbarY;
     if (compactToolbar) x = margin;
-    const int formatWidth = (std::max)(190, rightMargin - x - workersWidth -
-        qualityWidth - (compactToolbar ? 16 : 24));
+    const int formatWidth = (std::max)(190, rightMargin - x - qualityWidth -
+        (compactToolbar ? 8 : 16));
     MoveWindow(g_format, x, selectorsY, formatWidth, 250, TRUE);
     x += formatWidth + 8;
     MoveWindow(g_quality, x, selectorsY, qualityWidth, 250, TRUE);
-    x += qualityWidth + 8;
-    MoveWindow(g_workers, x, selectorsY, workersWidth, 150, TRUE);
 
     const int footerHeight = kFooterHeight;
     const int listTop = compactToolbar ? 98 : 58;
