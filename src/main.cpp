@@ -20,6 +20,7 @@
 #include <cwctype>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -60,11 +61,16 @@ constexpr UINT kUpdateCheckMessage = WM_APP + 6;
 constexpr UINT kUpdateInstallMessage = WM_APP + 7;
 constexpr int kFooterHeight = 44;
 constexpr WORD kApplicationIconResource = 101;
-constexpr wchar_t kUpdateManifestUrl[] =
-    L"https://github.com/snuffbait/AudioForge/releases/download/latest/AudioForge-update.txt";
-constexpr wchar_t kUpdateExecutableUrl[] =
-    L"https://github.com/snuffbait/AudioForge/releases/download/latest/AudioForge.exe";
+constexpr wchar_t kUpdateDownloadRoot[] =
+    L"/snuffbait/AudioForge/releases/download/latest/";
 constexpr size_t kMaximumUpdateBytes = 64 * 1024 * 1024;
+constexpr size_t kMaximumAssetBytes = 32 * 1024 * 1024;
+constexpr const char* kUpdateAssetNames[] = {
+    "audioforge-logo.png",
+    "audioforge.ico",
+    "done-goblin.mp3",
+    "done.mp3",
+};
 
 enum ControlId : int {
     IdAddFiles = 100,
@@ -241,11 +247,29 @@ struct TaskUpdate {
 struct UpdateInfo {
     std::wstring commit;
     std::wstring sha256;
+    std::vector<std::pair<std::wstring, std::wstring>> assets;
 };
 
 struct UpdateInstallResult {
     bool started;
     std::wstring error;
+};
+
+struct UpdateStagingCleanup {
+    fs::path directory;
+    bool keep = false;
+
+    ~UpdateStagingCleanup() {
+        if (keep) return;
+        DeleteFileW((directory / L"AudioForge.exe").c_str());
+        const fs::path assets = directory / L"assets";
+        for (const char* name : kUpdateAssetNames) {
+            const std::wstring wideName(name, name + std::strlen(name));
+            DeleteFileW((assets / wideName).c_str());
+        }
+        RemoveDirectoryW(assets.c_str());
+        RemoveDirectoryW(directory.c_str());
+    }
 };
 
 HWND g_window = nullptr;
@@ -479,6 +503,7 @@ bool parseUpdateManifest(const std::vector<unsigned char>& data,
     const std::string manifest(data.begin(), data.end());
     std::string commit;
     std::string sha256;
+    std::map<std::string, std::string> assets;
     std::istringstream lines(manifest);
     std::string line;
     while (std::getline(lines, line)) {
@@ -487,13 +512,38 @@ bool parseUpdateManifest(const std::vector<unsigned char>& data,
             commit = line.substr(7);
         } else if (line.rfind("sha256=", 0) == 0 && sha256.empty()) {
             sha256 = line.substr(7);
+        } else if (line.rfind("asset=", 0) == 0) {
+            const std::string asset = line.substr(6);
+            const size_t separator = asset.find(',');
+            if (separator == std::string::npos) return false;
+            const std::string name = asset.substr(0, separator);
+            const std::string hash = asset.substr(separator + 1);
+            const bool knownAsset = std::any_of(std::begin(kUpdateAssetNames),
+                std::end(kUpdateAssetNames), [&name](const char* known) {
+                    return name == known;
+                });
+            if (!knownAsset || !isHexString(hash, 64) ||
+                !assets.emplace(name, hash).second) {
+                return false;
+            }
         } else if (!line.empty()) {
             return false;
         }
     }
-    if (!isHexString(commit, 40) || !isHexString(sha256, 64)) return false;
+    if (!isHexString(commit, 40) || !isHexString(sha256, 64) ||
+        assets.size() != std::size(kUpdateAssetNames)) {
+        return false;
+    }
     update.commit.assign(commit.begin(), commit.end());
     update.sha256.assign(sha256.begin(), sha256.end());
+    update.assets.clear();
+    for (const char* name : kUpdateAssetNames) {
+        const auto asset = assets.find(name);
+        if (asset == assets.end()) return false;
+        update.assets.emplace_back(
+            std::wstring(asset->first.begin(), asset->first.end()),
+            std::wstring(asset->second.begin(), asset->second.end()));
+    }
     return true;
 }
 
@@ -584,7 +634,7 @@ void installUpdate(const UpdateInfo update) {
     std::vector<unsigned char> executable;
     if (!httpGet(L"/snuffbait/AudioForge/releases/download/latest/AudioForge.exe",
             kMaximumUpdateBytes, executable)) {
-        result->error = L"Could not download the update from GitHub.";
+        result->error = L"Could not download the application update from GitHub.";
         postUpdateInstallResult(result.release());
         return;
     }
@@ -600,15 +650,52 @@ void installUpdate(const UpdateInfo update) {
 
     const fs::path targetPath(g_modulePath);
     const std::wstring processId = std::to_wstring(GetCurrentProcessId());
-    const fs::path stagedPath = targetPath.parent_path() /
-        (L"AudioForge.update." + processId + L".exe");
+    const fs::path stagingDirectory = targetPath.parent_path() /
+        (L"AudioForge.update." + processId);
+    UpdateStagingCleanup stagingCleanup{stagingDirectory};
+    const fs::path stagedAssetsDirectory = stagingDirectory / L"assets";
+    std::error_code directoryError;
+    fs::create_directories(stagedAssetsDirectory, directoryError);
+    if (directoryError) {
+        result->error = L"Could not create an update staging folder beside AudioForge. Check that the application folder is writable.";
+        postUpdateInstallResult(result.release());
+        return;
+    }
+
+    const fs::path stagedPath = stagingDirectory / L"AudioForge.exe";
     if (!writeUpdateFile(stagedPath, executable)) {
         result->error = L"Could not save the update beside AudioForge. Check that the application folder is writable.";
         postUpdateInstallResult(result.release());
         return;
     }
+
+    for (const auto& asset : update.assets) {
+        std::vector<unsigned char> assetData;
+        const std::wstring downloadPath = std::wstring(kUpdateDownloadRoot) +
+            asset.first;
+        if (!httpGet(downloadPath.c_str(), kMaximumAssetBytes, assetData)) {
+            result->error = L"Could not download required asset " + asset.first +
+                L" from GitHub.";
+            postUpdateInstallResult(result.release());
+            return;
+        }
+        const std::string actualAssetHash = sha256Bytes(assetData);
+        const std::wstring actualAssetHashWide(actualAssetHash.begin(),
+                                                actualAssetHash.end());
+        if (actualAssetHash.empty() ||
+            lower(actualAssetHashWide) != lower(asset.second)) {
+            result->error = L"The downloaded asset " + asset.first +
+                L" failed its SHA-256 verification.";
+            postUpdateInstallResult(result.release());
+            return;
+        }
+        if (!writeUpdateFile(stagedAssetsDirectory / asset.first, assetData)) {
+            result->error = L"Could not stage required asset " + asset.first + L".";
+            postUpdateInstallResult(result.release());
+            return;
+        }
+    }
     if (g_updateCancel.load()) {
-        DeleteFileW(stagedPath.c_str());
         return;
     }
 
@@ -616,7 +703,6 @@ void installUpdate(const UpdateInfo update) {
     const DWORD directoryLength = GetTempPathW(
         static_cast<DWORD>(std::size(temporaryDirectory)), temporaryDirectory);
     if (directoryLength == 0 || directoryLength >= std::size(temporaryDirectory)) {
-        DeleteFileW(stagedPath.c_str());
         result->error = L"Could not find a temporary folder for the update helper.";
         postUpdateInstallResult(result.release());
         return;
@@ -625,7 +711,6 @@ void installUpdate(const UpdateInfo update) {
         (L"AudioForgeUpdater-" + processId + L".exe");
     DeleteFileW(helperPath.c_str());
     if (!CopyFileW(g_modulePath.c_str(), helperPath.c_str(), FALSE)) {
-        DeleteFileW(stagedPath.c_str());
         result->error = L"Could not prepare the update helper (Windows error " +
             std::to_wstring(GetLastError()) + L").";
         postUpdateInstallResult(result.release());
@@ -635,7 +720,9 @@ void installUpdate(const UpdateInfo update) {
     std::wstring command = quoteArgument(helperPath.wstring()) +
         L" --apply-update " + processId + L" " +
         quoteArgument(targetPath.wstring()) + L" " +
-        quoteArgument(stagedPath.wstring());
+        quoteArgument(stagedPath.wstring()) + L" " +
+        quoteArgument(stagedAssetsDirectory.wstring()) + L" " +
+        quoteArgument((targetPath.parent_path() / L"assets").wstring());
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION process{};
@@ -643,7 +730,6 @@ void installUpdate(const UpdateInfo update) {
             FALSE, CREATE_NO_WINDOW, nullptr, targetPath.parent_path().c_str(),
             &startup, &process)) {
         DeleteFileW(helperPath.c_str());
-        DeleteFileW(stagedPath.c_str());
         result->error = L"Could not start the update helper (Windows error " +
             std::to_wstring(GetLastError()) + L").";
         postUpdateInstallResult(result.release());
@@ -651,6 +737,7 @@ void installUpdate(const UpdateInfo update) {
     }
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
+    stagingCleanup.keep = true;
     result->started = true;
     postUpdateInstallResult(result.release());
 }
@@ -705,7 +792,7 @@ int runUpdateHelper(int argc, wchar_t** argv) {
         MessageBoxW(nullptr, message.c_str(), L"AudioForge update failed",
                     MB_OK | MB_ICONERROR);
     };
-    if (argc != 5 || std::wstring(argv[1]) != L"--apply-update") {
+    if (argc != 7 || std::wstring(argv[1]) != L"--apply-update") {
         showError(L"The update helper received invalid arguments.");
         return 1;
     }
@@ -730,6 +817,27 @@ int runUpdateHelper(int argc, wchar_t** argv) {
 
     const fs::path targetPath(argv[3]);
     const fs::path stagedPath(argv[4]);
+    const fs::path stagedAssetsPath(argv[5]);
+    const fs::path targetAssetsPath(argv[6]);
+    if (!CreateDirectoryW(targetAssetsPath.c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        showError(L"Could not create the AudioForge assets folder (Windows error " +
+            std::to_wstring(GetLastError()) + L").");
+        return 1;
+    }
+
+    for (const char* assetName : kUpdateAssetNames) {
+        const std::wstring name(assetName, assetName + std::strlen(assetName));
+        const fs::path stagedAsset = stagedAssetsPath / name;
+        const fs::path targetAsset = targetAssetsPath / name;
+        if (!MoveFileExW(stagedAsset.c_str(), targetAsset.c_str(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            showError(L"Could not install required asset " + name +
+                L" (Windows error " + std::to_wstring(GetLastError()) + L").");
+            return 1;
+        }
+    }
+
     if (!MoveFileExW(stagedPath.c_str(), targetPath.c_str(),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         showError(L"Could not replace AudioForge.exe (Windows error " +
@@ -751,6 +859,9 @@ int runUpdateHelper(int argc, wchar_t** argv) {
     }
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
+
+    RemoveDirectoryW(stagedAssetsPath.c_str());
+    RemoveDirectoryW(stagedAssetsPath.parent_path().c_str());
 
     std::wstring helperPath(32768, L'\0');
     const DWORD helperLength = GetModuleFileNameW(nullptr, helperPath.data(),

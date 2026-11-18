@@ -31,10 +31,15 @@ jobs:
         shell: pwsh
         run: |
           $hash = (Get-FileHash 'build\Release\AudioForge.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
-          @(
+          $manifest = @(
             "commit=$env:GITHUB_SHA"
             "sha256=$hash"
-          ) | Set-Content -Path AudioForge-update.txt -Encoding ascii
+          )
+          Get-ChildItem 'build\Release\assets' -File | Sort-Object Name | ForEach-Object {
+            $assetHash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            $manifest += "asset=$($_.Name),$assetHash"
+          }
+          $manifest | Set-Content -Path AudioForge-update.txt -Encoding ascii
 
       - name: Publish rolling update
         shell: pwsh
@@ -47,10 +52,13 @@ jobs:
           git push --force origin refs/tags/latest
 
           gh release view latest *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload latest build\Release\AudioForge.exe AudioForge-update.txt --clobber
+          $releaseExists = $LASTEXITCODE -eq 0
+          $assets = @(Get-ChildItem 'build\Release\assets' -File | ForEach-Object { $_.FullName })
+          $releaseFiles = @('build\Release\AudioForge.exe', 'AudioForge-update.txt') + $assets
+          if ($releaseExists) {
+            gh release upload latest $releaseFiles --clobber
           } else {
-            gh release create latest build\Release\AudioForge.exe AudioForge-update.txt `
+            gh release create latest $releaseFiles `
               --title "AudioForge latest" `
               --notes "Automatically built from the latest main branch source."
           }
