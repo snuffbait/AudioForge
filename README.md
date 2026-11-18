@@ -2,7 +2,7 @@
 
 A Windows audio converter written in C++.
 
-<img width="575" height="391" alt="fdfgdgdgdgf" src="https://github.com/user-attachments/assets/1a52832a-bfc3-4b2c-8587-d8deae48bdad" />
+<img width="573" height="391" alt="gdfgfgdfgd" src="https://github.com/user-attachments/assets/fe8bcc50-9d08-4f37-8461-adcfec7096e1" />
 
 ## Requirements
 
