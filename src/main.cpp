@@ -9,6 +9,8 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <uxtheme.h>
+#include <winhttp.h>
+#include <bcrypt.h>
 
 #include <algorithm>
 #include <atomic>
@@ -17,6 +19,7 @@
 #include <condition_variable>
 #include <cwctype>
 #include <cstdlib>
+#include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -32,6 +35,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifndef AUDIOFORGE_COMMIT
+#define AUDIOFORGE_COMMIT "unknown"
+#endif
 
 #ifdef _MSC_VER
 #pragma comment(lib, "comctl32.lib")
@@ -49,8 +56,15 @@ constexpr UINT kTaskUpdateMessage = WM_APP + 1;
 constexpr UINT kConversionCompleteMessage = WM_APP + 2;
 constexpr UINT kArtworkReadyMessage = WM_APP + 4;
 constexpr UINT kMetadataReadyMessage = WM_APP + 5;
+constexpr UINT kUpdateCheckMessage = WM_APP + 6;
+constexpr UINT kUpdateInstallMessage = WM_APP + 7;
 constexpr int kFooterHeight = 44;
 constexpr WORD kApplicationIconResource = 101;
+constexpr wchar_t kUpdateManifestUrl[] =
+    L"https://github.com/snuffbait/AudioForge/releases/download/latest/AudioForge-update.txt";
+constexpr wchar_t kUpdateExecutableUrl[] =
+    L"https://github.com/snuffbait/AudioForge/releases/download/latest/AudioForge.exe";
+constexpr size_t kMaximumUpdateBytes = 64 * 1024 * 1024;
 
 enum ControlId : int {
     IdAddFiles = 100,
@@ -224,6 +238,16 @@ struct TaskUpdate {
     std::wstring status;
 };
 
+struct UpdateInfo {
+    std::wstring commit;
+    std::wstring sha256;
+};
+
+struct UpdateInstallResult {
+    bool started;
+    std::wstring error;
+};
+
 HWND g_window = nullptr;
 HWND g_list = nullptr;
 HIMAGELIST g_rowImages = nullptr;
@@ -240,6 +264,8 @@ std::vector<Track> g_tracks;
 std::vector<std::thread> g_workerThreads;
 std::thread g_artworkThread;
 std::thread g_metadataThread;
+std::thread g_updateCheckThread;
+std::thread g_updateInstallThread;
 std::mutex g_artworkMutex;
 std::condition_variable g_artworkCondition;
 std::deque<ArtworkRequest> g_artworkQueue;
@@ -249,10 +275,13 @@ std::condition_variable g_metadataCondition;
 std::deque<MetadataRequest> g_metadataQueue;
 bool g_metadataStop = false;
 std::atomic_bool g_cancel{false};
+std::atomic_bool g_updateCancel{false};
 std::mutex g_activeProcessMutex;
 std::vector<HANDLE> g_activeProcesses;
 bool g_isConverting = false;
 bool g_completionSoundOpen = false;
+std::unique_ptr<UpdateInfo> g_pendingUpdate;
+std::wstring g_modulePath;
 int g_completedCount = 0;
 int g_failedCount = 0;
 int g_cancelledCount = 0;
@@ -275,6 +304,7 @@ LRESULT CALLBACK darkHeaderProc(HWND header, UINT message, WPARAM wParam, LPARAM
                                 UINT_PTR subclassId, DWORD_PTR referenceData);
 void drawComboItem(const DRAWITEMSTRUCT* item);
 void drawButton(const DRAWITEMSTRUCT* item);
+void setControlsEnabled(bool enabled);
 
 void setDarkTitleBar(HWND window) {
     constexpr DWORD kUseImmersiveDarkMode = 20;
@@ -361,6 +391,375 @@ std::wstring quoteArgument(const std::wstring& argument) {
     quoted.append(slashes * 2, L'\\');
     quoted += L'"';
     return quoted;
+}
+
+class WinHttpHandle {
+public:
+    explicit WinHttpHandle(HINTERNET handle) : handle_(handle) {}
+    ~WinHttpHandle() {
+        if (handle_) WinHttpCloseHandle(handle_);
+    }
+
+    HINTERNET get() const { return handle_; }
+    explicit operator bool() const { return handle_ != nullptr; }
+
+private:
+    HINTERNET handle_;
+};
+
+bool httpGet(const wchar_t* path, size_t maxBytes,
+             std::vector<unsigned char>& data) {
+    WinHttpHandle session(WinHttpOpen(L"AudioForge update check/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0));
+    if (!session) return false;
+    WinHttpSetTimeouts(session.get(), 5000, 5000, 10000, 10000);
+
+    WinHttpHandle connection(WinHttpConnect(session.get(), L"github.com",
+        INTERNET_DEFAULT_HTTPS_PORT, 0));
+    if (!connection) return false;
+
+    WinHttpHandle request(WinHttpOpenRequest(connection.get(), L"GET", path,
+        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE));
+    if (!request) return false;
+
+    if (!WinHttpSendRequest(request.get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(request.get(), nullptr)) {
+        return false;
+    }
+
+    DWORD status = 0;
+    DWORD statusSize = sizeof(status);
+    if (!WinHttpQueryHeaders(request.get(),
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize,
+            WINHTTP_NO_HEADER_INDEX) || status != HTTP_STATUS_OK) {
+        return false;
+    }
+
+    DWORD contentLength = 0;
+    DWORD contentLengthSize = sizeof(contentLength);
+    if (WinHttpQueryHeaders(request.get(),
+            WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &contentLength, &contentLengthSize,
+            WINHTTP_NO_HEADER_INDEX) && contentLength > maxBytes) {
+        return false;
+    }
+
+    data.clear();
+    for (;;) {
+        DWORD available = 0;
+        if (!WinHttpQueryDataAvailable(request.get(), &available)) return false;
+        if (available == 0) return true;
+        if (available > maxBytes - data.size()) return false;
+
+        const size_t oldSize = data.size();
+        data.resize(oldSize + available);
+        DWORD received = 0;
+        if (!WinHttpReadData(request.get(), data.data() + oldSize,
+                available, &received) || received == 0) {
+            return false;
+        }
+        data.resize(oldSize + received);
+    }
+}
+
+bool isHexString(const std::string& value, size_t expectedLength) {
+    return value.size() == expectedLength &&
+        std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+            return (ch >= '0' && ch <= '9') ||
+                (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+        });
+}
+
+bool parseUpdateManifest(const std::vector<unsigned char>& data,
+                         UpdateInfo& update) {
+    const std::string manifest(data.begin(), data.end());
+    std::string commit;
+    std::string sha256;
+    std::istringstream lines(manifest);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("commit=", 0) == 0 && commit.empty()) {
+            commit = line.substr(7);
+        } else if (line.rfind("sha256=", 0) == 0 && sha256.empty()) {
+            sha256 = line.substr(7);
+        } else if (!line.empty()) {
+            return false;
+        }
+    }
+    if (!isHexString(commit, 40) || !isHexString(sha256, 64)) return false;
+    update.commit.assign(commit.begin(), commit.end());
+    update.sha256.assign(sha256.begin(), sha256.end());
+    return true;
+}
+
+std::string sha256Bytes(const std::vector<unsigned char>& data) {
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM,
+            nullptr, 0) != 0) {
+        return {};
+    }
+
+    DWORD objectLength = 0;
+    DWORD hashLength = 0;
+    DWORD bytesRead = 0;
+    if (BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
+            reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength),
+            &bytesRead, 0) != 0 ||
+        BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH,
+            reinterpret_cast<PUCHAR>(&hashLength), sizeof(hashLength),
+            &bytesRead, 0) != 0) {
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        return {};
+    }
+
+    std::vector<unsigned char> hashObject(objectLength);
+    std::vector<unsigned char> hash(hashLength);
+    BCRYPT_HASH_HANDLE hashHandle = nullptr;
+    const NTSTATUS createStatus = BCryptCreateHash(algorithm, &hashHandle,
+        hashObject.data(), objectLength, nullptr, 0, 0);
+    if (createStatus != 0) {
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        return {};
+    }
+
+    const NTSTATUS hashStatus = BCryptHashData(hashHandle,
+        const_cast<PUCHAR>(data.data()), static_cast<ULONG>(data.size()), 0);
+    const NTSTATUS finishStatus = hashStatus == 0
+        ? BCryptFinishHash(hashHandle, hash.data(), hashLength, 0)
+        : hashStatus;
+    BCryptDestroyHash(hashHandle);
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    if (finishStatus != 0) return {};
+
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(hash.size() * 2);
+    for (unsigned char byte : hash) {
+        result += kHex[byte >> 4];
+        result += kHex[byte & 0x0f];
+    }
+    return result;
+}
+
+bool writeUpdateFile(const fs::path& path,
+                     const std::vector<unsigned char>& data) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+
+    size_t writtenTotal = 0;
+    bool succeeded = true;
+    while (writtenTotal < data.size()) {
+        const DWORD chunk = static_cast<DWORD>(
+            (std::min)(data.size() - writtenTotal,
+                       static_cast<size_t>(MAXDWORD)));
+        DWORD written = 0;
+        if (!WriteFile(file, data.data() + writtenTotal, chunk, &written, nullptr) ||
+            written == 0) {
+            succeeded = false;
+            break;
+        }
+        writtenTotal += written;
+    }
+    if (succeeded && !FlushFileBuffers(file)) succeeded = false;
+    CloseHandle(file);
+    return succeeded;
+}
+
+void postUpdateInstallResult(UpdateInstallResult* result) {
+    if (!PostMessageW(g_window, kUpdateInstallMessage, 0,
+            reinterpret_cast<LPARAM>(result))) {
+        delete result;
+    }
+}
+
+void installUpdate(const UpdateInfo update) {
+    auto result = std::make_unique<UpdateInstallResult>();
+    result->started = false;
+    std::vector<unsigned char> executable;
+    if (!httpGet(L"/snuffbait/AudioForge/releases/download/latest/AudioForge.exe",
+            kMaximumUpdateBytes, executable)) {
+        result->error = L"Could not download the update from GitHub.";
+        postUpdateInstallResult(result.release());
+        return;
+    }
+    if (g_updateCancel.load()) return;
+
+    const std::string actualHash = sha256Bytes(executable);
+    if (actualHash.empty() || lower(std::wstring(actualHash.begin(), actualHash.end())) !=
+            lower(update.sha256)) {
+        result->error = L"The downloaded update failed its SHA-256 verification.";
+        postUpdateInstallResult(result.release());
+        return;
+    }
+
+    const fs::path targetPath(g_modulePath);
+    const std::wstring processId = std::to_wstring(GetCurrentProcessId());
+    const fs::path stagedPath = targetPath.parent_path() /
+        (L"AudioForge.update." + processId + L".exe");
+    if (!writeUpdateFile(stagedPath, executable)) {
+        result->error = L"Could not save the update beside AudioForge. Check that the application folder is writable.";
+        postUpdateInstallResult(result.release());
+        return;
+    }
+    if (g_updateCancel.load()) {
+        DeleteFileW(stagedPath.c_str());
+        return;
+    }
+
+    wchar_t temporaryDirectory[MAX_PATH]{};
+    const DWORD directoryLength = GetTempPathW(
+        static_cast<DWORD>(std::size(temporaryDirectory)), temporaryDirectory);
+    if (directoryLength == 0 || directoryLength >= std::size(temporaryDirectory)) {
+        DeleteFileW(stagedPath.c_str());
+        result->error = L"Could not find a temporary folder for the update helper.";
+        postUpdateInstallResult(result.release());
+        return;
+    }
+    const fs::path helperPath = fs::path(temporaryDirectory) /
+        (L"AudioForgeUpdater-" + processId + L".exe");
+    DeleteFileW(helperPath.c_str());
+    if (!CopyFileW(g_modulePath.c_str(), helperPath.c_str(), FALSE)) {
+        DeleteFileW(stagedPath.c_str());
+        result->error = L"Could not prepare the update helper (Windows error " +
+            std::to_wstring(GetLastError()) + L").";
+        postUpdateInstallResult(result.release());
+        return;
+    }
+
+    std::wstring command = quoteArgument(helperPath.wstring()) +
+        L" --apply-update " + processId + L" " +
+        quoteArgument(targetPath.wstring()) + L" " +
+        quoteArgument(stagedPath.wstring());
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(helperPath.c_str(), command.data(), nullptr, nullptr,
+            FALSE, CREATE_NO_WINDOW, nullptr, targetPath.parent_path().c_str(),
+            &startup, &process)) {
+        DeleteFileW(helperPath.c_str());
+        DeleteFileW(stagedPath.c_str());
+        result->error = L"Could not start the update helper (Windows error " +
+            std::to_wstring(GetLastError()) + L").";
+        postUpdateInstallResult(result.release());
+        return;
+    }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    result->started = true;
+    postUpdateInstallResult(result.release());
+}
+
+void startUpdateInstall(const UpdateInfo& update) {
+    if (g_updateInstallThread.joinable()) g_updateInstallThread.join();
+    g_updateCancel = false;
+    setControlsEnabled(false);
+    SetWindowTextW(g_statusLabel, L"Downloading and verifying update...");
+    g_updateInstallThread = std::thread([update]() {
+        installUpdate(update);
+    });
+}
+
+void offerUpdate(std::unique_ptr<UpdateInfo> update) {
+    if (g_isConverting) {
+        g_pendingUpdate = std::move(update);
+        return;
+    }
+    const std::wstring message = L"A newer AudioForge build (" +
+        update->commit.substr(0, 8) +
+        L") is available. Download and install it now?";
+    if (MessageBoxW(g_window, message.c_str(), L"AudioForge update available",
+            MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2) == IDYES) {
+        startUpdateInstall(*update);
+    }
+}
+
+void checkForUpdate() {
+    UpdateInfo update;
+    std::vector<unsigned char> manifestData;
+    if (!httpGet(L"/snuffbait/AudioForge/releases/download/latest/AudioForge-update.txt",
+            1024, manifestData) ||
+        !parseUpdateManifest(manifestData, update)) {
+        return;
+    }
+    const std::string currentCommit = AUDIOFORGE_COMMIT;
+    const std::wstring currentCommitWide(currentCommit.begin(), currentCommit.end());
+    if (currentCommit == "unknown" ||
+        lower(currentCommitWide) == lower(update.commit)) {
+        return;
+    }
+    auto* result = new UpdateInfo(std::move(update));
+    if (!PostMessageW(g_window, kUpdateCheckMessage, 0,
+            reinterpret_cast<LPARAM>(result))) {
+        delete result;
+    }
+}
+
+int runUpdateHelper(int argc, wchar_t** argv) {
+    auto showError = [](const std::wstring& message) {
+        MessageBoxW(nullptr, message.c_str(), L"AudioForge update failed",
+                    MB_OK | MB_ICONERROR);
+    };
+    if (argc != 5 || std::wstring(argv[1]) != L"--apply-update") {
+        showError(L"The update helper received invalid arguments.");
+        return 1;
+    }
+
+    wchar_t* end = nullptr;
+    const unsigned long parentId = std::wcstoul(argv[2], &end, 10);
+    if (!end || *end != L'\0' || parentId == 0) {
+        showError(L"The update helper received an invalid process ID.");
+        return 1;
+    }
+    HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, parentId);
+    if (!parent) {
+        showError(L"Could not wait for AudioForge to close.");
+        return 1;
+    }
+    const DWORD waitResult = WaitForSingleObject(parent, INFINITE);
+    CloseHandle(parent);
+    if (waitResult != WAIT_OBJECT_0) {
+        showError(L"Could not wait for AudioForge to close.");
+        return 1;
+    }
+
+    const fs::path targetPath(argv[3]);
+    const fs::path stagedPath(argv[4]);
+    if (!MoveFileExW(stagedPath.c_str(), targetPath.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        showError(L"Could not replace AudioForge.exe (Windows error " +
+            std::to_wstring(GetLastError()) +
+            L"). You can still install the update manually from GitHub.");
+        return 1;
+    }
+
+    std::wstring command = quoteArgument(targetPath.wstring());
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(targetPath.c_str(), command.data(), nullptr, nullptr,
+            FALSE, 0, nullptr, targetPath.parent_path().c_str(),
+            &startup, &process)) {
+        showError(L"The update was installed, but AudioForge could not be restarted (Windows error " +
+            std::to_wstring(GetLastError()) + L").");
+        return 1;
+    }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+
+    std::wstring helperPath(32768, L'\0');
+    const DWORD helperLength = GetModuleFileNameW(nullptr, helperPath.data(),
+        static_cast<DWORD>(helperPath.size()));
+    if (helperLength > 0 && helperLength < helperPath.size()) {
+        helperPath.resize(helperLength);
+        MoveFileExW(helperPath.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+    }
+    return 0;
 }
 
 std::wstring findFfmpeg() {
@@ -1398,6 +1797,30 @@ void setControlsEnabled(bool enabled) {
     EnableWindow(g_buttons[6], !enabled);
 }
 
+void startUpdateCheck() {
+    if (std::string(AUDIOFORGE_COMMIT) == "unknown") return;
+    g_updateCheckThread = std::thread(checkForUpdate);
+}
+
+void handleUpdateCheck(LPARAM parameter) {
+    std::unique_ptr<UpdateInfo> update(reinterpret_cast<UpdateInfo*>(parameter));
+    offerUpdate(std::move(update));
+}
+
+void handleUpdateInstall(LPARAM parameter) {
+    std::unique_ptr<UpdateInstallResult> result(
+        reinterpret_cast<UpdateInstallResult*>(parameter));
+    if (result->started) {
+        PostMessageW(g_window, WM_CLOSE, 0, 0);
+        return;
+    }
+
+    setControlsEnabled(true);
+    updateEmptyState();
+    MessageBoxW(g_window, result->error.c_str(), L"AudioForge update failed",
+                MB_OK | MB_ICONERROR);
+}
+
 void beginConversion() {
     if (g_isConverting) return;
     if (g_tracks.empty()) {
@@ -2090,6 +2513,10 @@ void handleConversionComplete() {
             beginConversion();
         }
     }
+    if (g_pendingUpdate) {
+        std::unique_ptr<UpdateInfo> update = std::move(g_pendingUpdate);
+        offerUpdate(std::move(update));
+    }
 }
 
 LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -2233,6 +2660,12 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
     case kMetadataReadyMessage:
         handleMetadataReady(lParam);
         return 0;
+    case kUpdateCheckMessage:
+        handleUpdateCheck(lParam);
+        return 0;
+    case kUpdateInstallMessage:
+        handleUpdateInstall(lParam);
+        return 0;
     case kConversionCompleteMessage:
         handleConversionComplete();
         return 0;
@@ -2258,6 +2691,7 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         return 0;
     }
     case WM_CLOSE:
+        g_updateCancel = true;
         if (g_isConverting) {
             stopConversion();
             for (auto& worker : g_workerThreads) {
@@ -2275,6 +2709,8 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         }
         stopArtworkWorker();
         stopMetadataWorker();
+        if (g_updateCheckThread.joinable()) g_updateCheckThread.join();
+        if (g_updateInstallThread.joinable()) g_updateInstallThread.join();
         if (g_themePanelBrush) DeleteObject(g_themePanelBrush);
         if (g_themeBackgroundBrush) DeleteObject(g_themeBackgroundBrush);
         PostQuitMessage(0);
@@ -2288,6 +2724,18 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
+    int argumentCount = 0;
+    wchar_t** arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
+    if (arguments) {
+        const bool updateHelper = argumentCount > 1 &&
+            std::wstring(arguments[1]) == L"--apply-update";
+        const int helperResult = updateHelper
+            ? runUpdateHelper(argumentCount, arguments)
+            : 0;
+        LocalFree(arguments);
+        if (updateHelper) return helperResult;
+    }
+
     SetProcessDPIAware();
     std::wstring modulePath(32768, L'\0');
     const DWORD moduleLength = GetModuleFileNameW(nullptr, modulePath.data(),
@@ -2298,6 +2746,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         return 1;
     }
     modulePath.resize(moduleLength);
+    g_modulePath = modulePath;
     g_defaultOutputFolder = fs::path(modulePath).parent_path() / L"output";
     std::error_code outputError;
     fs::create_directories(g_defaultOutputFolder, outputError);
@@ -2351,6 +2800,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     setDarkTitleBar(window);
     ShowWindow(window, showCommand);
     UpdateWindow(window);
+    startUpdateCheck();
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {

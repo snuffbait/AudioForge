@@ -1,0 +1,56 @@
+name: Publish Windows update
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-windows-update
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure
+        run: cmake -S . -B build -A x64 -DAUDIOFORGE_COMMIT=${{ github.sha }}
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Create update manifest
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash 'build\Release\AudioForge.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
+          @(
+            "commit=$env:GITHUB_SHA"
+            "sha256=$hash"
+          ) | Set-Content -Path AudioForge-update.txt -Encoding ascii
+
+      - name: Publish rolling update
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag --force latest $env:GITHUB_SHA
+          git push --force origin refs/tags/latest
+
+          gh release view latest *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload latest build\Release\AudioForge.exe AudioForge-update.txt --clobber
+          } else {
+            gh release create latest build\Release\AudioForge.exe AudioForge-update.txt `
+              --title "AudioForge latest" `
+              --notes "Automatically built from the latest main branch source."
+          }
