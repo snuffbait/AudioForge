@@ -1498,6 +1498,7 @@ void beginConversion() {
     const auto sharedTasks = std::make_shared<const std::vector<WorkerTask>>(std::move(tasks));
     g_workerThreads.emplace_back([sharedTasks, ffmpeg]() {
         for (size_t index = 0; index < sharedTasks->size() && !g_cancel.load(); ++index) {
+            constexpr size_t maxAttempts = 4;
             size_t attempt = 0;
             while (!g_cancel.load()) {
                 std::wstring failureReason;
@@ -1506,9 +1507,16 @@ void beginConversion() {
                 if (result != ConversionResult::Failed) break;
 
                 ++attempt;
+                if (attempt >= maxAttempts) {
+                    postTaskUpdate(index, L"Failed: " + failureReason +
+                        L" (after " + std::to_wstring(maxAttempts) + L" attempts)");
+                    break;
+                }
+
                 postTaskUpdate(index, L"Retrying after attempt " +
                     std::to_wstring(attempt) + L" failed: " + failureReason);
-                for (int waited = 0; waited < 1000 && !g_cancel.load(); waited += 100) {
+                const DWORD retryDelay = 1000u << (attempt - 1);
+                for (DWORD waited = 0; waited < retryDelay && !g_cancel.load(); waited += 100) {
                     Sleep(100);
                 }
                 if (g_cancel.load()) {
