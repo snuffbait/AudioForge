@@ -2044,8 +2044,29 @@ void handleConversionComplete() {
             updateTrackRow(i);
         }
     }
+
+    g_completedCount = 0;
+    g_failedCount = 0;
+    g_cancelledCount = 0;
+    for (const auto& track : g_tracks) {
+        if (track.status == L"Complete") ++g_completedCount;
+        else if (track.status.rfind(L"Failed:", 0) == 0) ++g_failedCount;
+        else if (track.status == L"Cancelled") ++g_cancelledCount;
+    }
+
     const int finished = g_completedCount + g_failedCount + g_cancelledCount;
     SendMessageW(g_progress, PBM_SETPOS, finished, 0);
+
+    for (size_t i = g_tracks.size(); i > 0; --i) {
+        const size_t index = i - 1;
+        if (g_tracks[index].status == L"Complete") {
+            ListView_DeleteItem(g_list, static_cast<int>(index));
+            g_tracks.erase(g_tracks.begin() +
+                static_cast<std::vector<Track>::difference_type>(index));
+        }
+    }
+    for (size_t i = 0; i < g_tracks.size(); ++i) updateTrackRow(i);
+
     setControlsEnabled(true);
     updateEmptyState();
     InvalidateRect(g_window, nullptr, FALSE);
@@ -2055,10 +2076,19 @@ void handleConversionComplete() {
         std::to_wstring(g_cancelledCount) + L" cancelled";
     SetWindowTextW(g_statusLabel, summary.c_str());
     playCompletionSound();
-    if (g_failedCount > 0) {
-        MessageBoxW(g_window,
-            L"Some audio files could not be converted. Check their queue status and make sure FFmpeg supports the selected codec.",
-            L"Conversion finished with errors", MB_OK | MB_ICONWARNING);
+
+    if (!g_tracks.empty()) {
+        const int answer = MessageBoxW(g_window,
+            (std::to_wstring(g_tracks.size()) +
+             L" file(s) were not converted successfully. Would you like to try them again now?").c_str(),
+            L"Retry incomplete conversions", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+        if (answer == IDYES) {
+            for (size_t i = 0; i < g_tracks.size(); ++i) {
+                g_tracks[i].status = L"Ready";
+                updateTrackRow(i);
+            }
+            beginConversion();
+        }
     }
 }
 
