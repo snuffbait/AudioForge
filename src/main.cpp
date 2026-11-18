@@ -1298,10 +1298,11 @@ void addAudioFile(const fs::path& path, const fs::path& sourceFolder = {}) {
 
     g_tracks.push_back({path, sourceFolder, L"Reading metadata...", {}, {}, {}, 0});
     const int row = ListView_GetItemCount(g_list);
+    const std::wstring filename = g_tracks.back().path.filename().wstring();
     LVITEMW item{};
     item.mask = LVIF_TEXT;
     item.iItem = row;
-    item.pszText = const_cast<wchar_t*>(g_tracks.back().path.filename().c_str());
+    item.pszText = const_cast<wchar_t*>(filename.c_str());
     item.mask |= LVIF_IMAGE;
     item.iImage = g_tracks.back().imageIndex;
     ListView_InsertItem(g_list, &item);
