@@ -22,24 +22,10 @@ jobs:
           fetch-depth: 0
 
       - name: Configure
-        run: cmake -S . -B build -A x64 -DAUDIOFORGE_COMMIT=${{ github.sha }}
+        run: cmake -S . -B build -A x64
 
       - name: Build
         run: cmake --build build --config Release
-
-      - name: Create update manifest
-        shell: pwsh
-        run: |
-          $hash = (Get-FileHash 'build\Release\AudioForge.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
-          $manifest = @(
-            "commit=$env:GITHUB_SHA"
-            "sha256=$hash"
-          )
-          Get-ChildItem 'build\Release\assets' -File | Sort-Object Name | ForEach-Object {
-            $assetHash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-            $manifest += "asset=$($_.Name),$assetHash"
-          }
-          $manifest | Set-Content -Path AudioForge-update.txt -Encoding ascii
 
       - name: Publish rolling update
         shell: pwsh
@@ -53,12 +39,17 @@ jobs:
 
           gh release view latest *> $null
           $releaseExists = $LASTEXITCODE -eq 0
-          $assets = @(Get-ChildItem 'build\Release\assets' -File | ForEach-Object { $_.FullName })
-          $releaseFiles = @('build\Release\AudioForge.exe', 'AudioForge-update.txt') + $assets
           if ($releaseExists) {
-            gh release upload latest $releaseFiles --clobber
+            $existingAssets = @(gh release view latest --json assets --jq '.assets[].name')
+            foreach ($asset in $existingAssets) {
+              if ($asset -ne 'AudioForge.exe') {
+                gh release delete-asset latest $asset --yes
+                if ($LASTEXITCODE -ne 0) { throw "Could not remove old release asset $asset" }
+              }
+            }
+            gh release upload latest build\Release\AudioForge.exe --clobber
           } else {
-            gh release create latest $releaseFiles `
+            gh release create latest build\Release\AudioForge.exe `
               --title "AudioForge latest" `
               --notes "Automatically built from the latest main branch source."
           }

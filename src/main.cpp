@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -37,10 +38,6 @@
 #include <thread>
 #include <vector>
 
-#ifndef AUDIOFORGE_COMMIT
-#define AUDIOFORGE_COMMIT "unknown"
-#endif
-
 #ifdef _MSC_VER
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
@@ -61,8 +58,12 @@ constexpr UINT kUpdateCheckMessage = WM_APP + 6;
 constexpr UINT kUpdateInstallMessage = WM_APP + 7;
 constexpr int kFooterHeight = 44;
 constexpr WORD kApplicationIconResource = 101;
-constexpr wchar_t kUpdateDownloadRoot[] =
-    L"/snuffbait/AudioForge/releases/download/latest/";
+constexpr wchar_t kUpdateReleaseApiPath[] =
+    L"/repos/snuffbait/AudioForge/releases/tags/latest";
+constexpr wchar_t kUpdateExecutablePath[] =
+    L"/snuffbait/AudioForge/releases/download/latest/AudioForge.exe";
+constexpr wchar_t kUpdateAssetsPath[] =
+    L"/snuffbait/AudioForge/main/assets/";
 constexpr size_t kMaximumUpdateBytes = 64 * 1024 * 1024;
 constexpr size_t kMaximumAssetBytes = 32 * 1024 * 1024;
 constexpr const char* kUpdateAssetNames[] = {
@@ -245,9 +246,8 @@ struct TaskUpdate {
 };
 
 struct UpdateInfo {
-    std::wstring commit;
     std::wstring sha256;
-    std::vector<std::pair<std::wstring, std::wstring>> assets;
+    bool assetsOnly = false;
 };
 
 struct UpdateInstallResult {
@@ -431,7 +431,7 @@ private:
     HINTERNET handle_;
 };
 
-bool httpGet(const wchar_t* path, size_t maxBytes,
+bool httpGet(const wchar_t* host, const wchar_t* path, size_t maxBytes,
              std::vector<unsigned char>& data) {
     WinHttpHandle session(WinHttpOpen(L"AudioForge update check/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
@@ -439,7 +439,7 @@ bool httpGet(const wchar_t* path, size_t maxBytes,
     if (!session) return false;
     WinHttpSetTimeouts(session.get(), 5000, 5000, 10000, 10000);
 
-    WinHttpHandle connection(WinHttpConnect(session.get(), L"github.com",
+    WinHttpHandle connection(WinHttpConnect(session.get(), host,
         INTERNET_DEFAULT_HTTPS_PORT, 0));
     if (!connection) return false;
 
@@ -498,53 +498,83 @@ bool isHexString(const std::string& value, size_t expectedLength) {
         });
 }
 
-bool parseUpdateManifest(const std::vector<unsigned char>& data,
-                         UpdateInfo& update) {
-    const std::string manifest(data.begin(), data.end());
-    std::string commit;
-    std::string sha256;
-    std::map<std::string, std::string> assets;
-    std::istringstream lines(manifest);
-    std::string line;
-    while (std::getline(lines, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.rfind("commit=", 0) == 0 && commit.empty()) {
-            commit = line.substr(7);
-        } else if (line.rfind("sha256=", 0) == 0 && sha256.empty()) {
-            sha256 = line.substr(7);
-        } else if (line.rfind("asset=", 0) == 0) {
-            const std::string asset = line.substr(6);
-            const size_t separator = asset.find(',');
-            if (separator == std::string::npos) return false;
-            const std::string name = asset.substr(0, separator);
-            const std::string hash = asset.substr(separator + 1);
-            const bool knownAsset = std::any_of(std::begin(kUpdateAssetNames),
-                std::end(kUpdateAssetNames), [&name](const char* known) {
-                    return name == known;
-                });
-            if (!knownAsset || !isHexString(hash, 64) ||
-                !assets.emplace(name, hash).second) {
-                return false;
+bool parseJsonString(const std::string& json, size_t& position,
+                     std::string& value) {
+    if (position >= json.size() || json[position] != '"') return false;
+    ++position;
+    value.clear();
+    while (position < json.size()) {
+        const char ch = json[position++];
+        if (ch == '"') return true;
+        if (ch == '\\') {
+            if (position >= json.size()) return false;
+            const char escaped = json[position++];
+            switch (escaped) {
+            case '"': value += '"'; break;
+            case '\\': value += '\\'; break;
+            case '/': value += '/'; break;
+            case 'b': value += '\b'; break;
+            case 'f': value += '\f'; break;
+            case 'n': value += '\n'; break;
+            case 'r': value += '\r'; break;
+            case 't': value += '\t'; break;
+            default: return false;
             }
-        } else if (!line.empty()) {
-            return false;
+        } else {
+            if (static_cast<unsigned char>(ch) < 0x20) return false;
+            value += ch;
         }
     }
-    if (!isHexString(commit, 40) || !isHexString(sha256, 64) ||
-        assets.size() != std::size(kUpdateAssetNames)) {
-        return false;
+    return false;
+}
+
+bool findJsonStringProperty(const std::string& json, const std::string& key,
+                            size_t start, std::string& value,
+                            size_t& nextPosition) {
+    const std::string quotedKey = "\"" + key + "\"";
+    size_t position = start;
+    while ((position = json.find(quotedKey, position)) != std::string::npos) {
+        size_t valuePosition = position + quotedKey.size();
+        while (valuePosition < json.size() &&
+               std::isspace(static_cast<unsigned char>(json[valuePosition]))) {
+            ++valuePosition;
+        }
+        if (valuePosition >= json.size() || json[valuePosition++] != ':') {
+            position += quotedKey.size();
+            continue;
+        }
+        while (valuePosition < json.size() &&
+               std::isspace(static_cast<unsigned char>(json[valuePosition]))) {
+            ++valuePosition;
+        }
+        if (!parseJsonString(json, valuePosition, value)) {
+            position += quotedKey.size();
+            continue;
+        }
+        nextPosition = valuePosition;
+        return true;
     }
-    update.commit.assign(commit.begin(), commit.end());
-    update.sha256.assign(sha256.begin(), sha256.end());
-    update.assets.clear();
-    for (const char* name : kUpdateAssetNames) {
-        const auto asset = assets.find(name);
-        if (asset == assets.end()) return false;
-        update.assets.emplace_back(
-            std::wstring(asset->first.begin(), asset->first.end()),
-            std::wstring(asset->second.begin(), asset->second.end()));
+    return false;
+}
+
+bool parseLatestRelease(const std::vector<unsigned char>& data,
+                        UpdateInfo& update) {
+    const std::string response(data.begin(), data.end());
+    size_t position = 0;
+    std::string name;
+    std::string digest;
+    while (findJsonStringProperty(response, "name", position, name, position)) {
+        if (name == "AudioForge.exe" &&
+            findJsonStringProperty(response, "digest", position, digest, position)) {
+            constexpr char kSha256Prefix[] = "sha256:";
+            if (digest.rfind(kSha256Prefix, 0) != 0) return false;
+            const std::string hash = digest.substr(sizeof(kSha256Prefix) - 1);
+            if (!isHexString(hash, 64)) return false;
+            update.sha256.assign(hash.begin(), hash.end());
+            return true;
+        }
     }
-    return true;
+    return false;
 }
 
 std::string sha256Bytes(const std::vector<unsigned char>& data) {
@@ -596,6 +626,16 @@ std::string sha256Bytes(const std::vector<unsigned char>& data) {
     return result;
 }
 
+std::string sha256File(const fs::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return {};
+    std::vector<unsigned char> data(
+        (std::istreambuf_iterator<char>(file)),
+        std::istreambuf_iterator<char>());
+    if (data.size() > kMaximumUpdateBytes) return {};
+    return sha256Bytes(data);
+}
+
 bool writeUpdateFile(const fs::path& path,
                      const std::vector<unsigned char>& data) {
     HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
@@ -632,7 +672,7 @@ void installUpdate(const UpdateInfo update) {
     auto result = std::make_unique<UpdateInstallResult>();
     result->started = false;
     std::vector<unsigned char> executable;
-    if (!httpGet(L"/snuffbait/AudioForge/releases/download/latest/AudioForge.exe",
+    if (!httpGet(L"github.com", kUpdateExecutablePath,
             kMaximumUpdateBytes, executable)) {
         result->error = L"Could not download the application update from GitHub.";
         postUpdateInstallResult(result.release());
@@ -669,28 +709,20 @@ void installUpdate(const UpdateInfo update) {
         return;
     }
 
-    for (const auto& asset : update.assets) {
+    for (const char* assetName : kUpdateAssetNames) {
+        const std::wstring asset(assetName, assetName + std::strlen(assetName));
         std::vector<unsigned char> assetData;
-        const std::wstring downloadPath = std::wstring(kUpdateDownloadRoot) +
-            asset.first;
-        if (!httpGet(downloadPath.c_str(), kMaximumAssetBytes, assetData)) {
-            result->error = L"Could not download required asset " + asset.first +
+        const std::wstring downloadPath = std::wstring(kUpdateAssetsPath) +
+            asset;
+        if (!httpGet(L"raw.githubusercontent.com", downloadPath.c_str(),
+                kMaximumAssetBytes, assetData)) {
+            result->error = L"Could not download required asset " + asset +
                 L" from GitHub.";
             postUpdateInstallResult(result.release());
             return;
         }
-        const std::string actualAssetHash = sha256Bytes(assetData);
-        const std::wstring actualAssetHashWide(actualAssetHash.begin(),
-                                                actualAssetHash.end());
-        if (actualAssetHash.empty() ||
-            lower(actualAssetHashWide) != lower(asset.second)) {
-            result->error = L"The downloaded asset " + asset.first +
-                L" failed its SHA-256 verification.";
-            postUpdateInstallResult(result.release());
-            return;
-        }
-        if (!writeUpdateFile(stagedAssetsDirectory / asset.first, assetData)) {
-            result->error = L"Could not stage required asset " + asset.first + L".";
+        if (!writeUpdateFile(stagedAssetsDirectory / asset, assetData)) {
+            result->error = L"Could not stage required asset " + asset + L".";
             postUpdateInstallResult(result.release());
             return;
         }
@@ -757,10 +789,12 @@ void offerUpdate(std::unique_ptr<UpdateInfo> update) {
         g_pendingUpdate = std::move(update);
         return;
     }
-    const std::wstring message = L"A newer AudioForge build (" +
-        update->commit.substr(0, 8) +
-        L") is available. Download and install it now?";
-    if (MessageBoxW(g_window, message.c_str(), L"AudioForge update available",
+    const std::wstring message = update->assetsOnly
+        ? L"AudioForge is missing required files. Download and install them now?"
+        : L"A newer AudioForge build is available. Download and install it now?";
+    const wchar_t* title = update->assetsOnly
+        ? L"AudioForge files missing" : L"AudioForge update available";
+    if (MessageBoxW(g_window, message.c_str(), title,
             MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2) == IDYES) {
         startUpdateInstall(*update);
     }
@@ -768,18 +802,34 @@ void offerUpdate(std::unique_ptr<UpdateInfo> update) {
 
 void checkForUpdate() {
     UpdateInfo update;
-    std::vector<unsigned char> manifestData;
-    if (!httpGet(L"/snuffbait/AudioForge/releases/download/latest/AudioForge-update.txt",
-            1024, manifestData) ||
-        !parseUpdateManifest(manifestData, update)) {
+    std::vector<unsigned char> releaseData;
+    if (!httpGet(L"api.github.com", kUpdateReleaseApiPath,
+            1024 * 1024, releaseData) ||
+        !parseLatestRelease(releaseData, update)) {
         return;
     }
-    const std::string currentCommit = AUDIOFORGE_COMMIT;
-    const std::wstring currentCommitWide(currentCommit.begin(), currentCommit.end());
-    if (currentCommit == "unknown" ||
-        lower(currentCommitWide) == lower(update.commit)) {
+
+    const std::string installedHash = sha256File(g_modulePath);
+    const std::wstring installedHashWide(installedHash.begin(), installedHash.end());
+    const std::wstring assetsDirectory =
+        (fs::path(g_modulePath).parent_path() / L"assets").wstring();
+    bool missingAssets = false;
+    for (const char* name : kUpdateAssetNames) {
+        const std::wstring assetName(name, name + std::strlen(name));
+        std::error_code error;
+        if (!fs::is_regular_file(fs::path(assetsDirectory) / assetName, error) ||
+            error) {
+            missingAssets = true;
+            break;
+        }
+    }
+
+    const bool executableIsCurrent =
+        !installedHash.empty() && lower(installedHashWide) == lower(update.sha256);
+    if (executableIsCurrent && !missingAssets) {
         return;
     }
+    update.assetsOnly = executableIsCurrent;
     auto* result = new UpdateInfo(std::move(update));
     if (!PostMessageW(g_window, kUpdateCheckMessage, 0,
             reinterpret_cast<LPARAM>(result))) {
@@ -1909,7 +1959,6 @@ void setControlsEnabled(bool enabled) {
 }
 
 void startUpdateCheck() {
-    if (std::string(AUDIOFORGE_COMMIT) == "unknown") return;
     g_updateCheckThread = std::thread(checkForUpdate);
 }
 

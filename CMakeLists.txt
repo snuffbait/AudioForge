@@ -5,20 +5,6 @@ if(NOT WIN32)
     message(FATAL_ERROR "AudioForge is a native Windows desktop application.")
 endif()
 
-set(AUDIOFORGE_COMMIT "" CACHE STRING "Source commit embedded in the application")
-if(NOT AUDIOFORGE_COMMIT)
-    execute_process(
-        COMMAND git rev-parse HEAD
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        OUTPUT_VARIABLE AUDIOFORGE_COMMIT
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET
-    )
-    if(NOT AUDIOFORGE_COMMIT)
-        set(AUDIOFORGE_COMMIT "unknown")
-    endif()
-endif()
-
 enable_language(RC)
 configure_file(assets/audioforge.ico "${CMAKE_CURRENT_BINARY_DIR}/audioforge.ico"
     COPYONLY)
@@ -28,8 +14,7 @@ configure_file(src/audioforge.rc.in "${CMAKE_CURRENT_BINARY_DIR}/audioforge.rc"
 add_executable(AudioForge WIN32 src/main.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/audioforge.rc")
 target_compile_features(AudioForge PRIVATE cxx_std_17)
-target_compile_definitions(AudioForge PRIVATE
-    UNICODE _UNICODE AUDIOFORGE_COMMIT="${AUDIOFORGE_COMMIT}")
+target_compile_definitions(AudioForge PRIVATE UNICODE _UNICODE)
 target_link_libraries(AudioForge PRIVATE
     bcrypt comctl32 comdlg32 dwmapi shell32 uxtheme winhttp winmm)
 
